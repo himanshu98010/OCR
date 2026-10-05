@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { Check, Clipboard, Download, FileImage, ImagePlus, Moon, RotateCcw, ScanText, Sparkles, Sun, X } from 'lucide-react'
-import { createWorker } from 'tesseract.js'
+import { createWorker, PSM } from 'tesseract.js'
 
 type View = 'upload' | 'ready' | 'processing' | 'result'
 const acceptedTypes = ['image/png', 'image/jpeg', 'image/webp']
@@ -24,6 +24,74 @@ function cleanOcrText(rawText: string) {
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
+}
+
+/**
+ * Enlarges and normalizes a photographed page, then separates two-column
+ * layouts at their central whitespace. This keeps reading order intact.
+ */
+async function prepareForOcr(file: File): Promise<string[]> {
+  const source = await createImageBitmap(file)
+  const scale = Math.min(2, Math.max(1, 2200 / source.width))
+  const width = Math.round(source.width * scale)
+  const height = Math.round(source.height * scale)
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const context = canvas.getContext('2d', { willReadFrequently: true })
+  if (!context) throw new Error('Image processing is unavailable')
+
+  context.drawImage(source, 0, 0, width, height)
+  source.close()
+  const pixels = context.getImageData(0, 0, width, height)
+  for (let index = 0; index < pixels.data.length; index += 4) {
+    const grey = pixels.data[index] * .299 + pixels.data[index + 1] * .587 + pixels.data[index + 2] * .114
+    // Mild contrast enhancement improves photographed print without erasing fine strokes.
+    const enhanced = Math.max(0, Math.min(255, (grey - 128) * 1.22 + 128))
+    pixels.data[index] = enhanced
+    pixels.data[index + 1] = enhanced
+    pixels.data[index + 2] = enhanced
+  }
+  context.putImageData(pixels, 0, 0)
+
+  const darknessAt = (x: number) => {
+    let ink = 0
+    let samples = 0
+    for (let y = Math.round(height * .12); y < height * .92; y += 10) {
+      const value = pixels.data[(y * width + x) * 4]
+      if (value < 165) ink += 1
+      samples += 1
+    }
+    return ink / samples
+  }
+  const rangeStart = Math.round(width * .38)
+  const rangeEnd = Math.round(width * .62)
+  const rawScores = Array.from({ length: rangeEnd - rangeStart }, (_, offset) => darknessAt(rangeStart + offset))
+  // A real column gutter is a *wide* strip of whitespace. Averaging a 3%-wide
+  // window prevents a narrow gap between words from being mistaken for a gutter.
+  const windowRadius = Math.max(12, Math.round(width * .015))
+  const scores = rawScores.map((_, index) => {
+    const from = Math.max(0, index - windowRadius)
+    const to = Math.min(rawScores.length, index + windowRadius)
+    return rawScores.slice(from, to).reduce((total, score) => total + score, 0) / (to - from)
+  })
+  const averageInk = scores.reduce((total, score) => total + score, 0) / scores.length
+  const lowestInk = Math.min(...scores)
+  const split = rangeStart + scores.indexOf(lowestInk)
+  const hasColumnGutter = lowestInk < averageInk * .35
+
+  const crop = (left: number, cropWidth: number) => {
+    const result = document.createElement('canvas')
+    result.width = cropWidth
+    result.height = height
+    result.getContext('2d')!.drawImage(canvas, left, 0, cropWidth, height, 0, 0, cropWidth, height)
+    return result.toDataURL('image/png')
+  }
+
+  if (!hasColumnGutter) return [canvas.toDataURL('image/png')]
+  // Keep a small overlap so a slightly imperfect split never cuts characters.
+  const overlap = Math.round(8 * scale)
+  return [crop(0, split + overlap), crop(split - overlap, width - split + overlap)]
 }
 
 function Button({ children, onClick, kind = 'primary', disabled = false, type = 'button' }: { children: React.ReactNode; onClick?: () => void; kind?: 'primary' | 'secondary' | 'quiet'; disabled?: boolean; type?: 'button' | 'submit' }) {
@@ -62,15 +130,25 @@ export default function App() {
     if (!file) return
     setView('processing'); setStage(0); setProgress(0); setError('')
     try {
+      const imageSections = await prepareForOcr(file)
+      let activeSection = 0
       const worker = await createWorker('eng', 1, { logger: message => {
         if (message.status === 'loading tesseract core') setStage(1)
         if (message.status === 'initializing tesseract') setStage(1)
-        if (message.status === 'recognizing text') { setStage(2); if (typeof message.progress === 'number') setProgress(Math.round(message.progress * 100)) }
+        if (message.status === 'recognizing text') {
+          setStage(2)
+          if (typeof message.progress === 'number') setProgress(Math.round(((activeSection + message.progress) / imageSections.length) * 100))
+        }
       } })
-      const { data } = await worker.recognize(file)
+      await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_COLUMN })
+      const recognizedSections: string[] = []
+      for (activeSection = 0; activeSection < imageSections.length; activeSection += 1) {
+        const { data } = await worker.recognize(imageSections[activeSection])
+        recognizedSections.push(data.text)
+      }
       await worker.terminate()
       setStage(3); setProgress(100)
-      const output = cleanOcrText(data.text)
+      const output = cleanOcrText(recognizedSections.join('\n\n'))
       if (!output) { setError("Couldn't find readable text in this image."); setView('ready'); return }
       window.setTimeout(() => { setText(output); setView('result') }, 350)
     } catch { setError("We couldn't read this image. Please try another one."); setView('ready') }
